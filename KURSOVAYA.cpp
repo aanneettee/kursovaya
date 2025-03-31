@@ -11,6 +11,7 @@
 #include <system_error>
 
 using namespace std;
+atomic<bool> shouldStop{false};
 
 // Добавить класс конфигурации
 class Config {
@@ -21,7 +22,12 @@ public:
     bool verboseLogging;
     
     static Config loadFromFile(const filesystem::path& configPath) {
-        // Реализация чтения конфигурации из файла
+         Config config;
+    config.watchDirectory = "./test_files";
+    config.checkInterval = 5;
+    config.scanThreads = thread::hardware_concurrency();
+    config.verboseLogging = true;
+    return config;
     }
 };
 
@@ -201,32 +207,81 @@ void scanDirectory(const filesystem::path& dir) {
 
 // Добавить возможность параллельного хэширования файлов
 void parallelScanDirectory(const filesystem::path& dir, size_t threadCount = thread::hardware_concurrency()) {
+    // 1. Сбор всех файлов
+    vector<filesystem::path> files;
     try {
-        vector<filesystem::path> files;
         for (const auto& entry : filesystem::recursive_directory_iterator(dir)) {
-            if (entry.is_regular_file()) {
-                files.push_back(entry.path());
+            try {
+                if (entry.is_regular_file()) {
+                    files.push_back(entry.path());
+                }
+            } catch (const filesystem::filesystem_error& e) {
+                logger.error("Skipping inaccessible file: " + string(e.path1().string()) + 
+                           " - " + e.what());
             }
         }
+    } catch (const exception& e) {
+        throw FileMonitorException("Failed to list directory: " + string(e.what()));
+    }
 
-        vector<thread> workers;
-        size_t filesPerThread = (files.size() + threadCount - 1) / threadCount;
+    // 2. Оптимизация для малого количества файлов
+    if (files.empty()) {
+        logger.debug("No files found in directory");
+        return;
+    }
+    if (files.size() < threadCount * 4) { // Эмпирическое правило
+        threadCount = max(size_t(1), (files.size() + 3) / 4);
+        logger.debug("Reduced thread count to " + to_string(threadCount) + 
+                    " for " + to_string(files.size()) + " files");
+    }
 
-        for (size_t i = 0; i < threadCount; ++i) {
+    // 3. Подготовка результатов
+    vector<string> hashes(files.size());
+    vector<exception_ptr> exceptions(threadCount, nullptr);
+    
+    // 4. Параллельное хеширование
+    vector<thread> workers;
+    size_t filesPerThread = (files.size() + threadCount - 1) / threadCount;
+
+    for (size_t i = 0; i < threadCount; ++i) {
+        workers.emplace_back([this, i, filesPerThread, &files, &hashes, &exceptions]() {
             size_t start = i * filesPerThread;
             size_t end = min(start + filesPerThread, files.size());
-            workers.emplace_back([this, start, end, &files]() {
+            
+            try {
                 for (size_t j = start; j < end; ++j) {
-                    safeAddFile(files[j]);
+                    hashes[j] = FileHasher::calculateSHA256(files[j]);
                 }
-            });
-        }
+            } catch (...) {
+                exceptions[i] = current_exception();
+            }
+        });
+    }
 
-        for (auto& worker : workers) {
-            worker.join();
+    // 5. Ожидание завершения и обработка ошибок
+    for (auto& worker : workers) {
+        if (worker.joinable()) worker.join();
+    }
+
+    // 6. Проверка ошибок в потоках
+    for (size_t i = 0; i < exceptions.size(); ++i) {
+        if (exceptions[i]) {
+            try {
+                rethrow_exception(exceptions[i]);
+            } catch (const exception& e) {
+                logger.error("Thread " + to_string(i) + " failed: " + e.what());
+                throw FileMonitorException("Parallel hashing failed");
+            }
         }
-    } catch (const exception& e) {
-        throw FileMonitorException(string("Parallel directory scan failed: ") + e.what());
+    }
+
+    // 7. Атомарное обновление fileHashes
+    {
+        lock_guard<mutex> lock(mtx);
+        for (size_t i = 0; i < files.size(); ++i) {
+            fileHashes[files[i].string()] = move(hashes[i]);
+            logger.debug("Added: " + files[i].string());
+        }
     }
 }
 
@@ -252,31 +307,6 @@ void checkForChanges() {
         for (const auto& path : toRemove) {
             fileHashes.erase(path);
             cerr << "Removed inaccessible file from monitoring: " << path << endl;
-        }
-    }
-
-void startMonitoring(const filesystem::path& dir, int intervalSec) {
-        try {
-            if (!filesystem::exists(dir)) {
-                throw FileMonitorException("Directory does not exist: " + dir.string());
-            }
-
-            running = true;
-            scanDirectory(dir);
-            
-            monitorThread = thread([this, dir, intervalSec]() {
-                while (running) {
-                    try {
-                        this_thread::sleep_for(chrono::seconds(intervalSec));
-                        checkForChanges();
-                    } catch (const exception& e) {
-                        cerr << "Error in monitoring thread: " << e.what() << endl;
-                    }
-                }
-            });
-        } catch (const exception& e) {
-            running = false;
-            throw FileMonitorException(string("Monitoring start failed: ") + e.what());
         }
     }
 
@@ -307,19 +337,16 @@ int main(int argc, char* argv[]) {
         monitor.startMonitoring();
         
         // Ожидание сигнала завершения (Ctrl+C)
-        signal(SIGINT, [](int) { /* обработка сигнала */ });
-        signal(SIGTERM, [](int) { /* обработка сигнала */ });
+        signal(SIGINT, [](int) { shouldStop = true; });
+        signal(SIGTERM, [](int) { shouldStop = true; });
         
-        while (true) {
-            this_thread::sleep_for(chrono::seconds(1));
-        }
-        
-        return 0;
-    } catch (const FileMonitorException& e) {
-        cerr << "Fatal error: " << e.what() << endl;
-        return 1;
-    } catch (const exception& e) {
-        cerr << "Unexpected error: " << e.what() << endl;
-        return 2;
+        FileMonitor monitor(config);
+    monitor.startMonitoring();
+    
+    while (!shouldStop) {
+        this_thread::sleep_for(chrono::seconds(1));
     }
+    
+    monitor.stop();
+    return 0;
 }
