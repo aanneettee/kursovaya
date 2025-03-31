@@ -12,6 +12,43 @@
 
 using namespace std;
 
+// Добавить класс конфигурации
+class Config {
+public:
+    filesystem::path watchDirectory;
+    int checkInterval;
+    size_t scanThreads;
+    bool verboseLogging;
+    
+    static Config loadFromFile(const filesystem::path& configPath) {
+        // Реализация чтения конфигурации из файла
+    }
+};
+
+// Улучшенное логгирование
+class Logger {
+    mutex logMtx;
+    bool verbose;
+public:
+    Logger(bool verbose) : verbose(verbose) {}
+    
+    void log(const string& message) {
+        lock_guard<mutex> lock(logMtx);
+        cout << "[INFO] " << message << endl;
+    }
+    
+    void error(const string& message) {
+        lock_guard<mutex> lock(logMtx);
+        cerr << "[ERROR] " << message << endl;
+    }
+    
+    void debug(const string& message) {
+        if (verbose) {
+            lock_guard<mutex> lock(logMtx);
+            cout << "[DEBUG] " << message << endl;
+        }
+    }
+};
 
 class FileMonitorException : public runtime_error {
 public:
@@ -55,12 +92,13 @@ public:
             }
 
             string result;
-            for (unsigned char i : hash) {
-                char buf[3];
-                sprintf(buf, "%02x", i);
-                result += buf;
-            }
-            return result;
+    result.reserve(SHA256_DIGEST_LENGTH * 2); // Предварительное выделение памяти
+    static constexpr char hex[] = "0123456789abcdef";
+    for (unsigned char i : hash) {
+        result += hex[i >> 4];
+        result += hex[i & 0x0F];
+    }
+    return result;
         } catch (const exception& e) {
             throw FileHashException(string("Failed to calculate hash: ") + e.what());
         }
@@ -74,8 +112,10 @@ private:
     mutex mtx;
     atomic<bool> running{false};
     thread monitorThread;
+    Logger logger;
+    Config config;
 
-    void safeAddFile(const filesystem::path& path) {
+void safeAddFile(const filesystem::path& path) {
         try {
             string hash = FileHasher::calculateSHA256(path);
             lock_guard<mutex> lock(mtx);
@@ -87,27 +127,110 @@ private:
     }
 
 public:
+ FileMonitor(const Config& cfg) : config(cfg), logger(cfg.verboseLogging) {}
+    
+    void startMonitoring() {
+        try {
+            if (!filesystem::exists(config.watchDirectory)) {
+                throw FileMonitorException("Directory does not exist: " + config.watchDirectory.string());
+            }
+
+            running = true;
+            logger.log("Starting monitoring of: " + config.watchDirectory.string());
+            
+            if (config.scanThreads > 1) {
+                parallelScanDirectory(config.watchDirectory, config.scanThreads);
+            } else {
+                scanDirectory(config.watchDirectory);
+            }
+            
+            monitorThread = thread([this]() {
+                while (running) {
+                    auto start = chrono::steady_clock::now();
+                    
+                    try {
+                        checkForChanges();
+                    } catch (const exception& e) {
+                        logger.error("Error in monitoring thread: " + string(e.what()));
+                    }
+                    
+                    auto end = chrono::steady_clock::now();
+                    auto elapsed = chrono::duration_cast<chrono::milliseconds>(end - start);
+                    auto sleepTime = chrono::milliseconds(config.checkInterval * 1000) - elapsed;
+                    
+                    if (sleepTime.count() > 0) {
+                        this_thread::sleep_for(sleepTime);
+                    } else {
+                        logger.debug("Monitoring iteration took longer than interval");
+                    }
+                }
+            });
+            
+            logger.log("Monitoring started successfully");
+        } catch (const exception& e) {
+            running = false;
+            throw FileMonitorException(string("Monitoring start failed: ") + e.what());
+        }
+    }
     void addFile(const filesystem::path& path) {
         safeAddFile(path);
     }
 
-    void scanDirectory(const filesystem::path& dir) {
-        try {
-            for (const auto& entry : filesystem::recursive_directory_iterator(dir)) {
-                try {
-                    if (entry.is_regular_file()) {
-                        safeAddFile(entry.path());
-                    }
-                } catch (const filesystem::filesystem_error& e) {
-                    cerr << "Filesystem error processing " << entry.path() << ": " << e.what() << endl;
-                }
-            }
-        } catch (const exception& e) {
-            throw FileMonitorException(string("Directory scan failed: ") + e.what());
-        }
-    }
 
-    void checkForChanges() {
+
+// Добавить проверку на символические ссылки для предотвращения циклов
+void scanDirectory(const filesystem::path& dir) {
+    try {
+        for (const auto& entry : filesystem::recursive_directory_iterator(dir)) {
+            try {
+                if (entry.is_symlink()) {
+                    cerr << "Skipping symlink: " << entry.path() << endl;
+                    continue;
+                }
+                if (entry.is_regular_file()) {
+                    safeAddFile(entry.path());
+                }
+            } catch (const filesystem::filesystem_error& e) {
+                cerr << "Filesystem error processing " << entry.path() << ": " << e.what() << endl;
+            }
+        }
+    } catch (const exception& e) {
+        throw FileMonitorException(string("Directory scan failed: ") + e.what());
+    }
+}
+
+// Добавить возможность параллельного хэширования файлов
+void parallelScanDirectory(const filesystem::path& dir, size_t threadCount = thread::hardware_concurrency()) {
+    try {
+        vector<filesystem::path> files;
+        for (const auto& entry : filesystem::recursive_directory_iterator(dir)) {
+            if (entry.is_regular_file()) {
+                files.push_back(entry.path());
+            }
+        }
+
+        vector<thread> workers;
+        size_t filesPerThread = (files.size() + threadCount - 1) / threadCount;
+
+        for (size_t i = 0; i < threadCount; ++i) {
+            size_t start = i * filesPerThread;
+            size_t end = min(start + filesPerThread, files.size());
+            workers.emplace_back([this, start, end, &files]() {
+                for (size_t j = start; j < end; ++j) {
+                    safeAddFile(files[j]);
+                }
+            });
+        }
+
+        for (auto& worker : workers) {
+            worker.join();
+        }
+    } catch (const exception& e) {
+        throw FileMonitorException(string("Parallel directory scan failed: ") + e.what());
+    }
+}
+
+void checkForChanges() {
         lock_guard<mutex> lock(mtx);
         vector<string> toRemove;
         
@@ -132,7 +255,7 @@ public:
         }
     }
 
-    void startMonitoring(const filesystem::path& dir, int intervalSec) {
+void startMonitoring(const filesystem::path& dir, int intervalSec) {
         try {
             if (!filesystem::exists(dir)) {
                 throw FileMonitorException("Directory does not exist: " + dir.string());
@@ -157,7 +280,7 @@ public:
         }
     }
 
-    void stop() noexcept {
+void stop() noexcept {
         try {
             running = false;
             if (monitorThread.joinable()) {
@@ -174,19 +297,23 @@ public:
 };
 
 // 3. Интерфейс и конфигурация
-int main() {
+int main(int argc, char* argv[]) {
     try {
-        FileMonitor monitor;
+        // Чтение конфигурации
+        filesystem::path configPath = (argc > 1) ? argv[1] : "config.json";
+        Config config = Config::loadFromFile(configPath);
         
-        filesystem::path directoryToWatch = "./test_files";
-        int checkInterval = 5;
-
-        cout << "Starting monitoring of: " << directoryToWatch << "\n";
-        monitor.startMonitoring(directoryToWatch, checkInterval);
-
-        this_thread::sleep_for(chrono::seconds(30));
+        FileMonitor monitor(config);
+        monitor.startMonitoring();
         
-        cout << "Monitoring stopped.\n";
+        // Ожидание сигнала завершения (Ctrl+C)
+        signal(SIGINT, [](int) { /* обработка сигнала */ });
+        signal(SIGTERM, [](int) { /* обработка сигнала */ });
+        
+        while (true) {
+            this_thread::sleep_for(chrono::seconds(1));
+        }
+        
         return 0;
     } catch (const FileMonitorException& e) {
         cerr << "Fatal error: " << e.what() << endl;
